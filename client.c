@@ -7,7 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-#include <errno.h> // 用於 EAGAIN 和 EWOULDBLOCK
+#include <errno.h>
+#include <sys/select.h> // 使用 select 系統呼叫
 
 #define CLINET
 #include "config.h"
@@ -28,8 +29,6 @@ typedef struct {
 } OnlineUser;
 
 OnlineUser online_users[MAX_ONLINE_USERS];
-pthread_mutex_t users_lock = PTHREAD_MUTEX_INITIALIZER; // 用於同步在線用戶資料的鎖
-
 int conn_fd = -1;
 
 void show_menu();
@@ -39,6 +38,9 @@ void logged_in_interface(int conn_fd, char* username);
 void update_online_users(const char* data);
 void handle_user_list(const char *message);
 void* listen_for_server(void* arg);
+
+// 設定 recv 的 timeout（以秒為單位）
+#define RECV_TIMEOUT_SEC 5
 
 int main() {
     conn_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -90,22 +92,51 @@ void show_menu() {
     printf("3. Exit\n");
 }
 
+// 使用 select 設定超時的 recv 函數
+int recv_with_timeout(int socket_fd, char *buffer, size_t length) {
+    fd_set read_fds;
+    struct timeval timeout;
+
+    // 設定檔案描述符集
+    FD_ZERO(&read_fds);
+    FD_SET(socket_fd, &read_fds);
+
+    // 設定 timeout
+    timeout.tv_sec = RECV_TIMEOUT_SEC;
+    timeout.tv_usec = 0;
+
+    // 使用 select 等待資料到達
+    int result = select(socket_fd + 1, &read_fds, NULL, NULL, &timeout);
+    if (result < 0) {
+        perror("select"); // select 錯誤
+        return -1;
+    } else if (result == 0) {
+        printf("recv timeout: no data received within %d seconds.\n", RECV_TIMEOUT_SEC);
+        return 0; // 超時
+    }
+
+    // 如果有資料可讀，執行 recv
+    return recv(socket_fd, buffer, length, 0);
+}
+
 void send_register(int conn_fd) {
-    char name[MAXNAME + 1]; // +1 for null terminator
+    char name[MAXNAME + 1];
     printf("Enter the user name (max %d characters): ", MAXNAME);
     fflush(stdout);
     scanf("%15s", name);
 
-    // char buf[BUFFER_SIZE];
     snprintf(buf, sizeof(buf), "register:%s", name);
-    send(conn_fd, buf, BUFFER_SIZE, 0);
+    send(conn_fd, buf, strlen(buf), 0);
 
-    if (strncmp(buf, RESPONSE, strlen(RESPONSE))){
-        memset(buf, 0, BUFFER_SIZE);
-        bytes_received = recv(conn_fd, buf, BUFFER_SIZE - 1, 0);
-    }
+    memset(buf, 0, BUFFER_SIZE);
+    bytes_received = recv_with_timeout(conn_fd, buf, BUFFER_SIZE - 1);
     if (bytes_received <= 0) {
-        ERR_EXIT("recv");
+        if (bytes_received == 0) {
+            printf("No response from server.\n");
+        } else {
+            perror("recv");
+        }
+        return;
     }
     buf[bytes_received] = '\0'; // Ensure null-termination
 
@@ -122,24 +153,21 @@ void send_login(int conn_fd) {
     fflush(stdout);
     scanf("%15s", name);
 
-    // char buf[BUFFER_SIZE];
     snprintf(buf, sizeof(buf), "login:%s", name);
     send(conn_fd, buf, strlen(buf), 0);
 
-    printf("into send_login\n");
-    if (strncmp(buf, RESPONSE, strlen(RESPONSE))){
-        memset(buf, 0, BUFFER_SIZE);
-        bytes_received = recv(conn_fd, buf, BUFFER_SIZE - 1, 0);
-    }
+    memset(buf, 0, BUFFER_SIZE);
+    bytes_received = recv_with_timeout(conn_fd, buf, BUFFER_SIZE - 1);
     if (bytes_received <= 0) {
-        ERR_EXIT("recv");
+        if (bytes_received == 0) {
+            printf("No response from server.\n");
+        } else {
+            perror("recv");
+        }
+        return;
     }
-    printf("bute_receive:%d\n", bytes_received);
     buf[bytes_received] = '\0'; // Ensure null-termination
-    printf("asjdlkajds\n");
-    printf("buf %s\n", buf);
-    fflush(stdout);
-    printf("%d %c\n",strncmp(buf, RESPONSE, strlen(RESPONSE)),  buf[strlen(RESPONSE)]);
+
     if (!strncmp(buf, RESPONSE, strlen(RESPONSE)) && buf[strlen(RESPONSE)] == '1') {
         printf("\033[0;32m%s\033[0m\n", buf + strlen(RESPONSE) + 1);
         logged_in_interface(conn_fd, name);
@@ -165,14 +193,12 @@ void logged_in_interface(int conn_fd, char* username) {
 
         if (strcmp(choice, "1") == 0) {
             // 顯示在線用戶
-            pthread_mutex_lock(&users_lock);
             printf("Online users:\n");
             for (int i = 0; i < MAX_ONLINE_USERS; i++) {
                 if (online_users[i].status) {
                     printf("- %s (%s)\n", online_users[i].username, online_users[i].ip_port);
                 }
             }
-            pthread_mutex_unlock(&users_lock);
         } else if (strcmp(choice, "2") == 0) {
             // 發送訊息
             printf("Enter message: ");
@@ -183,11 +209,16 @@ void logged_in_interface(int conn_fd, char* username) {
             send(conn_fd, buf, strlen(buf), 0);
 
             memset(buf, 0, BUFFER_SIZE);
-            bytes_received = recv(conn_fd, buf, BUFFER_SIZE - 1, 0);
+            bytes_received = recv_with_timeout(conn_fd, buf, BUFFER_SIZE - 1);
             if (bytes_received <= 0) {
-                ERR_EXIT("recv");
+                if (bytes_received == 0) {
+                    printf("No response from server for your message.\n");
+                } else {
+                    perror("recv");
+                }
+                continue;
             }
-            buf[bytes_received] = '\0'; // Ensure null-termination
+            buf[bytes_received] = '\0'; // 確保以 NULL 結尾
 
             if (!strncmp(buf, RESPONSE, strlen(RESPONSE)) && buf[strlen(RESPONSE)] == '1') {
                 printf("\033[0;32m%s\033[0m\n", buf + strlen(RESPONSE) + 1);
@@ -196,6 +227,7 @@ void logged_in_interface(int conn_fd, char* username) {
             }
         } else if (strcmp(choice, "3") == 0) {
             send(conn_fd, "logout", strlen("logout"), 0);
+            printf("Logging out...\n");
             break;
         } else {
             printf("\033[0;31mUnknown choice. Please try again.\033[0m\n");
@@ -203,55 +235,44 @@ void logged_in_interface(int conn_fd, char* username) {
     }
 }
 
+
 void *listen_for_server(void *arg) {
     while (1) {
-        // memset(buf, 0, BUFFER_SIZE);
-        printf("208!\n");
-        bytes_received = recv(conn_fd, buf, BUFFER_SIZE - 1, 0);
-        printf("211\n");
+        memset(buf, 0, BUFFER_SIZE);
+        bytes_received = recv_with_timeout(conn_fd, buf, BUFFER_SIZE - 1);
         if (bytes_received <= 0) {
-            perror("recv");
-            break;
+            if (bytes_received == 0) {
+                printf("No data from server, skipping...\n");
+            } else {
+                perror("recv");
+            }
+            continue;
         }
 
         buf[bytes_received] = '\0'; // 確保以 NULL 結尾
+        printf("Received: %s\n", buf);
 
-        printf("lsited_for_server_buf:%s\n", buf);
         if (!strncmp(buf, "USER_LIST:", strlen("USER_LIST:"))) {
-            pthread_mutex_lock(&users_lock);
             handle_user_list(buf);
-            pthread_mutex_unlock(&users_lock);
         }
     }
     return NULL;
 }
 
 void handle_user_list(const char *message) {
-
-    // 清空在線用戶列表
     printf("into user list!\n");
     memset(online_users, 0, sizeof(online_users));
 
-    // 跳過消息前綴 "USER_LIST:"
     const char *user_list = message + strlen("USER_LIST:");
-
-    // 解析用戶信息
     char *token = strtok((char *)user_list, ",");
     int index = 0;
     while (token != NULL && index < MAX_ONLINE_USERS) {
-        int temp_status = 0; // 用於暫存狀態
-        sscanf(token, "%[^|]|%[^:]:%d",
-        online_users[index].username,
-        online_users[index].ip_port,
-        &temp_status);
-        online_users[index].status = (temp_status != 0);  // 將整數轉為布林值
-        online_users[index].status = true; // 標記為在線
+        sscanf(token, "%[^|]|%[^:]", online_users[index].username, online_users[index].ip_port);
+        online_users[index].status = true;
         token = strtok(NULL, ",");
         index++;
     }
 
-
-    // 顯示在線用戶列表
     printf("Updated online user list:\n");
     for (int i = 0; i < MAX_ONLINE_USERS; i++) {
         if (online_users[i].status) {
