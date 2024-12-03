@@ -1,3 +1,4 @@
+
 # Makefile for server and client programs
 
 # Compiler and flags
@@ -21,7 +22,7 @@ $(SERVER): $(SERVER_SRC)
 
 # Compile client
 $(CLIENT): $(CLIENT_SRC)
-	$(CC) -o $(CLIENT) $(CLIENT_SRC)
+	$(CC) $(CFLAGS) -o $(CLIENT) $(CLIENT_SRC)
 
 # Clean up generated files
 clean:
@@ -29,4 +30,3 @@ clean:
 
 # Phony targets
 .PHONY: all clean
-

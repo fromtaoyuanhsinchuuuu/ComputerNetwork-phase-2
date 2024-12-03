@@ -2,8 +2,8 @@
 #define CONFIG_H
 
 // 共用定義
-#define BUFFER_SIZE 512
-#define PORT 8000
+#define BUFFER_SIZE 1024
+#define PORT 8010
 #define MAXNAME 15
 #define ERR_EXIT(a) do { perror(a); exit(1); } while(0)
 #define LINE "================================"
@@ -16,7 +16,7 @@
 #endif
 
 // Client 專用定義
-#ifdef CLIENT
+#ifdef CLINET
 #define SERVER_IP "127.0.0.1"
 #endif
 
