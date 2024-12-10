@@ -17,7 +17,7 @@ typedef struct {
     char ip[INET_ADDRSTRLEN];
     int port;
     int socket_fd;  // 新增 socket 描述符
-    bool logged_in;
+    bool status;
 } User;
 
 User users[MAX_USERS];
@@ -42,6 +42,8 @@ void register_user(int conn_fd, char* name);
 bool login_user(int conn_fd, char* name, char* ip, int port);
 void broadcast_user_list(void);
 char *get_current_timestamp();
+void handle_user(int conn_fd, char* name); // 切換到用戶功能
+
 
 int main() {
     for (int i = 0; i < THREAD_POOL_SIZE; i++) {
@@ -118,30 +120,101 @@ int dequeue_task() {
 
 void handle_client(int conn_fd, struct sockaddr_in cliaddr) {
     char buf[BUFFER_SIZE];
-    char current_user_name[MAXNAME] = "";
-    char client_ip[INET_ADDRSTRLEN];
-    int client_port = ntohs(cliaddr.sin_port);
 
-    inet_ntop(AF_INET, &cliaddr.sin_addr, client_ip, INET_ADDRSTRLEN);
 
     while (1) {
         memset(buf, 0, BUFFER_SIZE);
         int len = recv(conn_fd, buf, BUFFER_SIZE, 0);
-        if (len <= 0) break; // Connection closed
+        if (len <= 0) {
+            printf("Client disconnected: %d\n", conn_fd);
+            close(conn_fd);
+            return;
+        }
 
+        printf("buf:%s\n", buf);
         if (strncmp(buf, "register:", 9) == 0) {
-            char* name = buf + 9;
+            char* name = buf + 9; // 提取用戶名稱
             register_user(conn_fd, name);
         } else if (strncmp(buf, "login:", 6) == 0) {
-            char* name = buf + 6;
+            // 提取 IP 和 Port
+            char client_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &cliaddr.sin_addr, client_ip, INET_ADDRSTRLEN);
+            int client_port = ntohs(cliaddr.sin_port);
+
+            // 處理登入
+            char* name = buf + 6; // 提取用戶名稱
             if (login_user(conn_fd, name, client_ip, client_port)) {
-                strncpy(current_user_name, name, MAXNAME);
-                broadcast_user_list();
+                printf("User logged in successfully: %s\n", name);
+                handle_user(conn_fd, name); // 切換到用戶功能
+                // break;
+            } else {
+                printf("Login failed for user: %s\n", name);
+                // send(conn_fd, "RESPONSE:0Login failed.", strlen("RESPONSE:0Login failed."), 0);
             }
+        } else if (strncmp(buf, "exit", 4) == 0) {
+            printf("Client exited: %d\n", conn_fd);
+            close(conn_fd);
+            return;
         } else {
-            char error_msg[BUFFER_SIZE];
-            snprintf(error_msg, sizeof(error_msg), "ERROR:0Unknown command.");
-            send(conn_fd, error_msg, strlen(error_msg), 0);
+            send(conn_fd, "RESPONSE:0Unknown command.", strlen("RESPONSE:0Unknown command."), 0);
+        }
+    }
+}
+
+void handle_user(int conn_fd, char* username) {
+    char buf[BUFFER_SIZE];
+    char response[BUFFER_SIZE];
+
+    while (1) {
+        memset(buf, 0, BUFFER_SIZE);
+        int len = recv(conn_fd, buf, BUFFER_SIZE, 0);
+        if (len <= 0) {
+            printf("User %s disconnected.\n", username);
+            close(conn_fd);
+            return;
+        }
+
+        if (strncmp(buf, "1", 1) == 0) { // show user list
+            // Show online users
+            pthread_mutex_lock(&users_lock);
+            snprintf(response, BUFFER_SIZE, "RESPONSE:USER_LIST:");
+            for (int i = 0; i < MAX_USERS; i++) {
+                if (users[i].status) {
+                    char user_info[128];
+                    snprintf(user_info, sizeof(user_info), "%s|%s:%d,", users[i].name,
+                             users[i].ip, users[i].port);
+                    strncat(response, user_info, sizeof(response) - strlen(response) - 1);
+                }
+            }
+            pthread_mutex_unlock(&users_lock);
+            send(conn_fd, response, strlen(response), 0);
+
+        } else if (strncmp(buf, "2:", 2) == 0) {
+            // Send message
+            char* message = buf + 2;
+            printf("Message from %s: %s\n", username, message);
+            snprintf(response, sizeof(response), "RESPONSE:1Message sent: %s", message);
+            send(conn_fd, response, strlen(response), 0);
+
+        } else if (strncmp(buf, "3", 1) == 0) {
+            // Logout
+            printf("User %s logged out.\n", username);
+            pthread_mutex_lock(&users_lock);
+            for (int i = 0; i < MAX_USERS; i++) {
+                if (strcmp(users[i].name, username) == 0) {
+                    users[i].status = false;
+                    users[i].socket_fd = -1; // 清空 socket 描述符
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&users_lock);
+            send(conn_fd, "RESPONSE:1Logged out successfully.", strlen("RESPONSE:1Logged out successfully."), 0);
+            close(conn_fd);
+            return;
+
+        } else {
+            snprintf(response, sizeof(response), "RESPONSE:0Unknown command.");
+            send(conn_fd, response, strlen(response), 0);
         }
     }
 }
@@ -167,7 +240,7 @@ void register_user(int conn_fd, char* name) {
             }
         }
         strncpy(users[user_count].name, name, MAXNAME);
-        users[user_count].logged_in = false;
+        users[user_count].status = false;
         user_count++;
         char success_msg[BUFFER_SIZE];
         snprintf(success_msg, sizeof(success_msg), "RESPONSE:1Registration successful.");
@@ -178,24 +251,29 @@ void register_user(int conn_fd, char* name) {
 
 bool login_user(int conn_fd, char* name, char* ip, int port) {
     pthread_mutex_lock(&users_lock);
+    printf("user_count:%d\n", user_count);
+
+    char buf[BUFFER_SIZE];
     for (int i = 0; i < user_count; i++) {
         if (strcmp(users[i].name, name) == 0) {
-            users[i].logged_in = true;
+            users[i].status = true;
             users[i].socket_fd = conn_fd;
             strncpy(users[i].ip, ip, INET_ADDRSTRLEN);
             users[i].port = port;
 
-            send(conn_fd, "RESPONSE:1Login successful.", BUFFER_SIZE, 0);
+            strncpy(buf, "RESPONSE:1Login successful.", BUFFER_SIZE);
+            int sent_byte = send(conn_fd, buf, BUFFER_SIZE, 0);
+            printf("sent bytes:%d\n", sent_byte);
 
-            // 廣播完整在線用戶列表
-            broadcast_user_list();
-
+            printf("now login:%s\n", name);
             pthread_mutex_unlock(&users_lock);
             return true;
         }
     }
 
-    send(conn_fd, "RESPONSE:0Login failed: user not registered.", BUFFER_SIZE, 0);
+    printf("269 login failed\n");
+    strncpy(buf, "RESPONSE:0Login failed: user not registered.", BUFFER_SIZE);
+    send(conn_fd, buf, BUFFER_SIZE, 0);
     pthread_mutex_unlock(&users_lock);
     return false;
 }
@@ -204,45 +282,16 @@ void logout_user(int conn_fd) {
     pthread_mutex_lock(&users_lock);
     for (int i = 0; i < user_count; i++) {
         if (users[i].socket_fd == conn_fd) {
-            users[i].logged_in = false;
+            users[i].status = false;
             users[i].socket_fd = -1;
             break;
         }
     }
     pthread_mutex_unlock(&users_lock);
 
-    // 廣播完整在線用戶列表
-    broadcast_user_list();
 }
 
-void broadcast_user_list() {
-    char message[BUFFER_SIZE];
-    memset(message, 0, BUFFER_SIZE);
 
-    // 編碼完整在線用戶列表
-    snprintf(message, sizeof(message), "USER_LIST:");
-    pthread_mutex_lock(&users_lock);
-    for (int i = 0; i < user_count; i++) {
-        if (users[i].logged_in) {
-            char user_info[100];
-            snprintf(user_info, sizeof(user_info), "%s|%s:%d,", 
-                     users[i].name, users[i].ip, users[i].port);
-            strncat(message, user_info, sizeof(message) - strlen(message) - 1);
-        }
-    }
-
-    // 向所有在線用戶廣播列表
-    for (int i = 0; i < user_count; i++) {
-        if (users[i].logged_in) {
-            if (send(users[i].socket_fd, message, strlen(message), 0) < 0) {
-                perror("send");
-            }
-        }
-    }
-    pthread_mutex_unlock(&users_lock);
-
-    printf("Broadcasted updated online user list: %s\n", message);
-}
 
 char* get_current_timestamp() {
     static char timestamp[20];
