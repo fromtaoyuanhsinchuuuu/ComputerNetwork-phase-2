@@ -16,7 +16,6 @@
 #define LINE "================================"
 
 #define QUEUE_FULL "queue full"
-#define WAIT_WORKER "wait worker"
 
 #define ACCEPT_TASK "accept task"
 

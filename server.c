@@ -92,9 +92,6 @@ int main() {
         if (queue_count >= QUEUE_SIZE)
             // task已滿，回覆連線失敗
             send(conn_fd, QUEUE_FULL, strlen(QUEUE_FULL), 0);
-        else
-            // task還有空間，接受連線請求，等待worker
-            send(conn_fd, WAIT_WORKER, strlen(WAIT_WORKER), 0);
         task_queue[queue_rear] = conn_fd;
         queue_rear = (queue_rear + 1) % QUEUE_SIZE;
         queue_count++;
