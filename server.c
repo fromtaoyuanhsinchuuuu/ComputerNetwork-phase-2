@@ -253,7 +253,7 @@ int login_user(int conn_fd, char* name, struct sockaddr_in cliaddr) {
 // Logged In
 void handle_user(int conn_fd, char* username) {
     char buf[BUFFER_SIZE];
-    char response[BUFFER_SIZE];
+    // char response[BUFFER_SIZE];
 
     while (true) {
         memset(buf, 0, BUFFER_SIZE);

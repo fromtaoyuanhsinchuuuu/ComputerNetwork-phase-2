@@ -1,182 +1,166 @@
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
-#include <errno.h>
-
-#define CLINET
+#include <unistd.h>
+#include <pthread.h>
+#include <arpa/inet.h>
 #include "config.h"
 
-#define RESPONSE "RESPONSE:"
-#define BROADCAST "BROADCAST:"
-#define ERROR "ERROR:"
-
-int bytes_received = -1;
+int c_receiver_port;
+int conn_fd;
 char buf[BUFFER_SIZE];
 
-int conn_fd = -1;
-
-void show_menu();
-void send_register(int conn_fd);
-void send_login(int conn_fd);
-void logged_in_interface(int conn_fd, char* username);
-void handle_user_list(const char *message);
-void* listen_for_server(void* arg);
+void show_main_menu();
+void show_logged_in_menu();
+void send_register();
+void send_login();
+void *c_receiver(void *arg);
+void handle_logged_in_interface(const char *username);
 
 int main() {
+    printf("Enter receiver port: ");
+    scanf("%d", &c_receiver_port);
+
     conn_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (conn_fd < 0) ERR_EXIT("socket");
 
     struct sockaddr_in servaddr;
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(PORT);
+    servaddr.sin_port = htons(SERVER_PORT);
     if (inet_pton(AF_INET, SERVER_IP, &servaddr.sin_addr) <= 0) ERR_EXIT("Invalid IP");
 
-    if (connect(conn_fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) ERR_EXIT("connect");
+    if (connect(conn_fd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+        ERR_EXIT("connect");
 
-    printf("Connected to server at port %d\n", PORT);
+    char server_response[BUFFER_SIZE];
+    recv(conn_fd, server_response, sizeof(server_response), 0);
+    if (strcmp(server_response, QUEUE_FULL) == 0) {
+        printf("Server response: queue full\n");
+        close(conn_fd);
+        exit(0);
+    } else if (strcmp(server_response, ACCEPT_TASK) == 0) {
+        printf("Server response: accept task\n");
+        pthread_t receiver_thread;
+        pthread_create(&receiver_thread, NULL, c_receiver, NULL);
+    }
 
-    char choice[BUFFER_SIZE];
     while (1) {
-        show_menu();
+        show_main_menu();
+        int choice;
         printf("Enter your choice: ");
-        fflush(stdout);
-        scanf("%15s", choice);
+        scanf("%d", &choice);
 
-        if (strcmp(choice, "1") == 0) {
-            send_register(conn_fd);
-        } else if (strcmp(choice, "2") == 0) {
-            send_login(conn_fd);
-        } else if (strcmp(choice, "3") == 0) {
-            printf("Exiting...\n");
-            break;
-        } else {
-            printf("\033[0;31mUnknown choice. Please try again.\033[0m\n");
+        switch (choice) {
+            case 1:
+                send_register();
+                break;
+            case 2:
+                send_login();
+                break;
+            case 3:
+                printf("Exiting...\n");
+                close(conn_fd);
+                exit(0);
+            default:
+                printf("Unknown choice. Please try again.\n");
         }
     }
 
-    close(conn_fd);
     return 0;
 }
 
-void show_menu() {
-    printf("Please choose one of the following options:\n");
+void show_main_menu() {
+    printf("\nPlease choose one of the following options:\n");
     printf("1. Register\n");
     printf("2. Login\n");
     printf("3. Exit\n");
 }
 
-void send_register(int conn_fd) {
-    char name[MAXNAME + 1];
-    printf("Enter the user name (max %d characters): ", MAXNAME);
-    fflush(stdout);
-    scanf("%15s", name);
+void show_logged_in_menu() {
+    printf("\nChoose an action:\n");
+    printf("1. Show online users\n");
+    printf("2. Send message\n");
+    printf("3. Log out\n");
+}
+
+void send_register() {
+    char name[MAX_NAME + 1];
+    printf("Enter your username (max %d characters): ", MAX_NAME);
+    scanf("%s", name);
 
     snprintf(buf, sizeof(buf), "register:%s", name);
     send(conn_fd, buf, strlen(buf), 0);
 
-    memset(buf, 0, BUFFER_SIZE);
-    bytes_received = recv(conn_fd, buf, BUFFER_SIZE - 1, 0);
-    if (bytes_received <= 0) {
-        if (bytes_received == 0) {
-            printf("No response from server.\n");
+    memset(buf, 0, sizeof(buf));
+    recv(conn_fd, buf, sizeof(buf), 0);
+    printf("Server response: %s\n", buf);
+}
+
+void send_login() {
+    char name[MAX_NAME + 1];
+    printf("Enter your username: ");
+    scanf("%s", name);
+
+    snprintf(buf, sizeof(buf), "login:%s", name);
+    send(conn_fd, buf, strlen(buf), 0);
+
+    memset(buf, 0, sizeof(buf));
+    recv(conn_fd, buf, sizeof(buf), 0);
+
+    if (strcmp(buf, ASK_RCVR_PORT) == 0) {
+        snprintf(buf, sizeof(buf), "%d", c_receiver_port);
+        send(conn_fd, buf, strlen(buf), 0);
+
+        memset(buf, 0, sizeof(buf));
+        recv(conn_fd, buf, sizeof(buf), 0);
+        if (strcmp(buf, LOGIN_SUCCESS) == 0) {
+            printf("Login successful!\n");
+            handle_logged_in_interface(name);
         } else {
-            perror("recv");
+            printf("Login failed: %s\n", buf);
         }
-        return;
-    }
-    buf[bytes_received] = '\0';
-
-    if (!strncmp(buf, RESPONSE, strlen(RESPONSE)) && buf[strlen(RESPONSE)] == '1') {
-        printf("\033[0;32m%s\033[0m\n", buf + strlen(RESPONSE) + 1);
     } else {
-        printf("\033[0;31m%s\033[0m\n", buf + strlen(RESPONSE) + 1);
+        printf("Login failed: %s\n", buf);
     }
 }
 
-void send_login(int conn_fd) {
-    char name[MAXNAME + 1];
-    printf("Enter the user name (max %d characters): ", MAXNAME);
-    fflush(stdout);
-    scanf("%15s", name);
-
-    printf("name:%s\n", name);
-    snprintf(buf, BUFFER_SIZE, "login:%s", name);
-    send(conn_fd, buf, BUFFER_SIZE, 0);
-
-    memset(buf, 0, BUFFER_SIZE);
-    bytes_received = recv(conn_fd, buf, BUFFER_SIZE, 0);
-    buf[bytes_received] = '\0';
-
-    // printf("buf:%s\n", buf);
-    if (!strncmp(buf, RESPONSE, strlen(RESPONSE)) && buf[strlen(RESPONSE)] == '1') {
-        printf("\033[0;32m%s\033[0m\n", buf + strlen(RESPONSE) + 1);
-        logged_in_interface(conn_fd, name);
-    } else {
-        printf("\033[0;31m%s\033[0m\n", buf + strlen(RESPONSE) + 1);
-    }
-}
-
-void logged_in_interface(int conn_fd, char* username) {
-    printf("Hi! %s\n", username);
-
-    char choice[BUFFER_SIZE];
+void *c_receiver(void *arg) {
+    printf("Receiver thread started on port %d\n", c_receiver_port);
     while (1) {
-        printf("Choose an action:\n");
-        printf("1. Show online users\n");
-        printf("2. Send message\n");
-        printf("3. Log out\n");
-        printf("Enter choice: ");
-        fflush(stdout);
-        scanf("%15s", choice);
+        char message[BUFFER_SIZE];
+        memset(message, 0, sizeof(message));
+        recv(conn_fd, message, sizeof(message), 0);
+        printf("[Server]: %s\n", message);
+    }
+    return NULL;
+}
 
-        if (strcmp(choice, "1") == 0) {
-            strncpy(choice, "1", BUFFER_SIZE);
-            send(conn_fd, choice, BUFFER_SIZE, 0);
+void handle_logged_in_interface(const char *username) {
+    while (1) {
+        show_logged_in_menu();
+        int choice;
+        printf("Enter your choice: ");
+        scanf("%d", &choice);
 
-            memset(buf, 0, BUFFER_SIZE);
-            bytes_received = recv(conn_fd, buf, BUFFER_SIZE - 1, 0);
-            if (bytes_received <= 0) {
-                printf("Failed to get user list from server.\n");
-                continue;
-            }
-            buf[bytes_received] = '\0';
-
-            if (!strncmp(buf, "RESPONSE:USER_LIST:", strlen("RESPONSE:USER_LIST:"))) {
-                handle_user_list(buf);
-            } else {
-                printf("Unexpected response from server: %s\n", buf);
-            }
-        } else if (strcmp(choice, "2") == 0) {
-            char message[BUFFER_SIZE];
-            printf("Enter message: ");
-            fflush(stdout);
-            scanf(" %[^\n]", message);
+        if (choice == 1) {
+            send(conn_fd, SHOW_LIST, strlen(SHOW_LIST), 0);
+            memset(buf, 0, sizeof(buf));
+            recv(conn_fd, buf, sizeof(buf), 0);
+            printf("Online users: %s\n", buf);
+        } else if (choice == 2) {
+            char message[MAX_MES];
+            printf("Enter your message: ");
+            scanf(" %[^]", message);
 
             snprintf(buf, sizeof(buf), "message:%s:%s", username, message);
             send(conn_fd, buf, strlen(buf), 0);
-        } else if (strcmp(choice, "3") == 0) {
-            send(conn_fd, "logout", strlen("logout"), 0);
+        } else if (choice == 3) {
+            send(conn_fd, LOGOUT, strlen(LOGOUT), 0);
+            printf("Logged out successfully.\n");
             break;
         } else {
-            printf("\033[0;31mUnknown choice. Please try again.\033[0m\n");
+            printf("Unknown choice. Please try again.\n");
         }
-    }
-}
-
-void handle_user_list(const char *message) {
-    printf("Online users:\n");
-
-    const char *user_list = message + strlen("RSEPONSE:USER_LIST:");
-    char *token = strtok((char *)user_list, ",");
-    while (token != NULL) {
-        printf("- %s\n", token);
-        token = strtok(NULL, ",");
     }
 }
