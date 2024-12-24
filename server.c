@@ -89,13 +89,15 @@ int main() {
 
         // 新增task
         pthread_mutex_lock(&queue_lock);
-        if (queue_count >= QUEUE_SIZE)
+        if (queue_count >= QUEUE_SIZE) {
             // task已滿，回覆連線失敗
             send(conn_fd, QUEUE_FULL, strlen(QUEUE_FULL), 0);
-        task_queue[queue_rear] = conn_fd;
-        queue_rear = (queue_rear + 1) % QUEUE_SIZE;
-        queue_count++;
-        pthread_cond_signal(&queue_not_empty);
+        } else {
+            task_queue[queue_rear] = conn_fd;
+            queue_rear = (queue_rear + 1) % QUEUE_SIZE;
+            queue_count++;
+            pthread_cond_signal(&queue_not_empty);
+        }
         pthread_mutex_unlock(&queue_lock);
     }
 
