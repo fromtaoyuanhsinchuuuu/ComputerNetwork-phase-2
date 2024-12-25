@@ -5,8 +5,8 @@
 #define SERVER_IP "127.0.0.1"
 #define SERVER_PORT 8011
 #define BUFFER_SIZE 1024
-#define MAX_NAME 15
-#define MAX_MES 512
+#define MAX_NAME 16
+#define MAX_MES (BUFFER_SIZE - SIGNAL_SIZE - 2 * MAX_NAME)
 #define MAX_ONLINE 10                  // 最多同時上限人數
 #define MAX_USERS 20                   // 最多註冊人數
 #define QUEUE_SIZE 20                  // 最多等待連線人數
@@ -17,10 +17,10 @@
 // Format:
 // [SIGNAL (32 bytes)][FROM (16 bytes)][TO (16 bytes)][MES (960 bytes)]
 #define SIGNAL_SIZE 32
-#define FROM_SIZE 16
-#define TO_SIZE 16
-#define MES_SIZE 960
-#define TOTAL_SIZE 1024
+#define FROM_SIZE MAX_NAME
+#define TO_SIZE MAX_NAME
+#define MES_SIZE (BUFFER_SIZE - SIGNAL_SIZE - 2 * MAX_NAME)
+#define TOTAL_SIZE BUFFER_SIZE
 
 // Function to format the buffer for sending messages
 void format_buffer(char* buf, const char* signal, const char* from, const char* to, const char* mes) {
@@ -76,5 +76,11 @@ void slice_buffer(const char* buf, char* signal, char* from, char* to, char* mes
     #define OFFLINE "offline"
 #define LOGOUT "logout"
     #define LOGOUT_SUCCESS "logout_success"
+
+#define IS_FILE "is_file"
+#define ACCEPT_FILE "accept_file"
+#define REJECT_FILE "reject_file"
+#define ACK_FILE "ack_file"
+#define END_OF_FILE "end_of_file"
 
 #endif

@@ -145,7 +145,7 @@ void handle_no_login(int conn_fd, struct sockaddr_in cliaddr) {
     while (true) {
         // 1. Register  |  2. Login  |  3. Exit
         memset(buf, 0, BUFFER_SIZE);
-        if (recv(conn_fd, buf, BUFFER_SIZE, 0) < 0) {
+        if (recv(conn_fd, buf, BUFFER_SIZE, 0) <= 0) {
             printf("[Disconnected] conn_fd: %d\n", conn_fd);
             break;
         }
@@ -198,7 +198,7 @@ int register_user(int conn_fd, char* name) {
         user_count++;
 
         if (send(conn_fd, REGISTER_SUCCESS, BUFFER_SIZE, 0) < 0) return -1;
-        printf("[Register] NO.%d %s\n", user_count-1, name);
+        printf("[Register] No.%d %s\n", user_count-1, name);
 
         return 1;
     }
@@ -266,9 +266,10 @@ void handle_user(int conn_fd, char* username) {
 
         if (strcmp(buf, SHOW_LIST) == 0) {       // Show online users list
             pthread_mutex_lock(&users_lock);
-            char user_info[1024];
+            char user_info[BUFFER_SIZE];
+            memset(user_info, 0, sizeof(user_info));
             for (int i = 0; i < user_count; i++) {
-                sprintf(user_info, "%2d: ", i);
+                sprintf(user_info + strlen(user_info), "%2d: ", i);
                 if (strcmp(username, users[i].name) == 0)
                     sprintf(user_info + strlen(user_info), "YOU ");
                 else if (users[i].status)
@@ -285,37 +286,45 @@ void handle_user(int conn_fd, char* username) {
                 break;
         } else if (strncmp(buf, SEND_MES, strlen(SEND_MES)) == 0) {            // Relay message
             int target_id = atoi(buf + strlen(SEND_MES));
-            if (send(conn_fd, ASK_MES, BUFFER_SIZE, 0) < 0)
+            printf("get target in relay mes: %d\n", target_id);
+            if (send(conn_fd, ASK_MES, BUFFER_SIZE, 0) < 0) {
+                printf("in\n");
                 break;
+            }
             char message[MAX_MES];
             memset(buf, 0, BUFFER_SIZE);
             if (recv(conn_fd, message, BUFFER_SIZE, 0) < 0)
                 break;
             printf("Message from %s to %d: %s\n", username, target_id, message);
 
+
             // 與目標receiver建立連線
             pthread_mutex_lock(&users_lock);
-            int tmp_fd = socket(AF_INET, SOCK_STREAM, 0);
-            if (tmp_fd < 0) ERR_EXIT("socket");
-            struct sockaddr_in targetaddr;
-            memset(&targetaddr, 0, sizeof(targetaddr));
-            targetaddr.sin_family = AF_INET;
-            targetaddr.sin_port = htons(users[target_id].receiver_port);
-            if (inet_pton(AF_INET, users[target_id].ip, &targetaddr.sin_addr) <= 0)
-                ERR_EXIT("Invalid IP");
-            pthread_mutex_unlock(&users_lock);
-            if (connect(tmp_fd, (struct sockaddr*)&targetaddr, sizeof(targetaddr)) < 0)
-                if (send(conn_fd, MES_FAIL, BUFFER_SIZE, 0) < 0) break;
-
-            // 傳訊息
-            char to_receiver[BUFFER_SIZE];
-            sprintf(to_receiver, "%s<%s>: %s", IS_MES, username, message);
-            if (send(tmp_fd, to_receiver, BUFFER_SIZE, 0) < 0) {
-                if (send(conn_fd, MES_FAIL, BUFFER_SIZE, 0) < 0) break;
+            if (users[target_id].status == false) {
+                if (send(conn_fd, OFFLINE, BUFFER_SIZE, 0) < 0) break;
             } else {
-                if (send(conn_fd, MES_SUCCESS, BUFFER_SIZE, 0) < 0) break;
+                int tmp_fd = socket(AF_INET, SOCK_STREAM, 0);
+                if (tmp_fd < 0) ERR_EXIT("socket");
+                struct sockaddr_in targetaddr;
+                memset(&targetaddr, 0, sizeof(targetaddr));
+                targetaddr.sin_family = AF_INET;
+                targetaddr.sin_port = htons(users[target_id].receiver_port);
+                if (inet_pton(AF_INET, users[target_id].ip, &targetaddr.sin_addr) <= 0)
+                    ERR_EXIT("Invalid IP");
+                pthread_mutex_unlock(&users_lock);
+                if (connect(tmp_fd, (struct sockaddr*)&targetaddr, sizeof(targetaddr)) < 0)
+                    if (send(conn_fd, MES_FAIL, BUFFER_SIZE, 0) < 0) break;
+
+                // 傳訊息
+                char to_receiver[BUFFER_SIZE];
+                format_buffer(to_receiver, IS_MES, username, NULL, message);
+                if (send(tmp_fd, to_receiver, BUFFER_SIZE, 0) < 0) {
+                    if (send(conn_fd, MES_FAIL, BUFFER_SIZE, 0) < 0) break;
+                } else {
+                    if (send(conn_fd, MES_SUCCESS, BUFFER_SIZE, 0) < 0) break;
+                }
+                close(tmp_fd);
             }
-            close(tmp_fd);
         } else if (strncmp(buf, ASK_USER_INFO, strlen(ASK_USER_INFO)) == 0) {       // Direct Message or File
             int target_id = atoi(buf + strlen(ASK_USER_INFO));
             pthread_mutex_lock(&users_lock);

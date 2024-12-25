@@ -3,7 +3,8 @@
 
 # Compiler and flags
 CC = gcc
-CFLAGS = -pthread -Wall -Wextra
+CFLAGS = -pthread -Wall -Wextra 
+CGTK = `pkg-config --cflags --libs gtk+-3.0`
 
 # Targets
 SERVER = server
@@ -22,7 +23,7 @@ $(SERVER): $(SERVER_SRC)
 
 # Compile client
 $(CLIENT): $(CLIENT_SRC)
-	$(CC) $(CFLAGS) -o $(CLIENT) $(CLIENT_SRC)
+	$(CC) $(CFLAGS) -o $(CLIENT) $(CLIENT_SRC) $(CGTK)
 
 # Clean up generated files
 clean:
