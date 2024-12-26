@@ -37,7 +37,7 @@ int main() {
     socklen_t client_addr_len = sizeof(client_addr);
 
     // 初始化 FFmpeg
-    av_register_all();
+    avcodec_register_all();
 
     // 打開視頻文件
     AVFormatContext *format_ctx = NULL;
