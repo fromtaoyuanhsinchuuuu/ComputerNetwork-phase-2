@@ -8,9 +8,11 @@
 
 // 連線設定
 #define SERVER_IP "127.0.0.1"
-#define SERVER_PORT 8011
-#define SIDE_PORT 8012
+#define SERVER_PORT 9530
+#define SIDE_PORT 9531
+#define STREAM_PORT 9532
 
+// 函数声明
 int create_listen_port(int *listen_fd, struct sockaddr_in *servaddr, int port, int max_connection);
 int connect_to_port(int *conn_fd, struct sockaddr_in *servaddr, char *ip, int port);
 
@@ -24,6 +26,12 @@ int connect_to_port(int *conn_fd, struct sockaddr_in *servaddr, char *ip, int po
 
 #define ERR_EXIT(a) do { perror(a); exit(1); } while(0)
 
+// 添加 error_exit 函数定义
+#define error_exit(msg) do { \
+    fprintf(stderr, "[Error] %s\n", msg); \
+    exit(1); \
+} while(0)
+
 // Configuration for message format
 #define SIGNAL_SIZE 32
 #define FROM_SIZE MAX_NAME
@@ -31,15 +39,19 @@ int connect_to_port(int *conn_fd, struct sockaddr_in *servaddr, char *ip, int po
 #define MES_SIZE (BUFFER_SIZE - SIGNAL_SIZE - 2 * MAX_NAME)
 #define TOTAL_SIZE BUFFER_SIZE
 
+// 函数声明
 void format_buffer(char* buf, const char* signal, const char* from, const char* to, const char* mes);
 void slice_buffer(const char* buf, char* signal, char* from, char* to, char* mes);
-
 char* timestamp();
 
-// SSL Initialization
+// SSL 函数声明
 SSL_CTX* initialize_ssl_server(const char* cert_file, const char* key_file);
 SSL_CTX* initialize_ssl_client();
 void cleanup_ssl();
+
+// 数据传输函数声明
+int send_full(int sockfd, const void *buf, size_t len);
+int recv_full(int sockfd, void *buf, size_t len);
 
 // 訊息定義
 #define LINE "================================"
@@ -86,27 +98,24 @@ void cleanup_ssl();
 
 // 顏色
 #define NONE "\033[m"
-
 #define RED "\033[0;32;31m"
 #define LIGHT_RED "\033[1;31m"
-
 #define GREEN "\033[0;32;32m"
 #define LIGHT_GREEN "\033[1;32m"
-
 #define BLUE "\033[0;32;34m"
 #define LIGHT_BLUE "\033[1;34m"
-
 #define DARY_GRAY "\033[1;30m"
 #define CYAN "\033[0;36m"
 #define LIGHT_CYAN "\033[1;36m"
-
 #define PURPLE "\033[0;35m"
 #define LIGHT_PURPLE "\033[1;35m"
-
 #define BROWN "\033[0;33m"
 #define YELLOW "\033[1;33m"
-
 #define LIGHT_GRAY "\033[0;37m"
 #define WHITE "\033[1;37m"
+
+// 添加 streaming 相關定義
+#define STREAM_CMD "STREAM"
+#define STREAM_SOCKET "Please connect to streaming socket"
 
 #endif

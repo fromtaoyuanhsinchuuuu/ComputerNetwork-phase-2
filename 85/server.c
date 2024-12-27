@@ -11,10 +11,17 @@
 #include <string.h>
 #include <stdbool.h>
 #include <time.h>
+#include <sys/time.h>
 
 // OpenSSL Headers
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+
+// FFmpeg Headers
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/avutil.h>
+#include <libswscale/swscale.h>
 
 //--- FUNCTION ---//
 // worker
@@ -29,8 +36,9 @@ int login_user_ssl(SSL *ssl, char* name);
 int handle_user_ssl(SSL *ssl, char* name);
 int show_user_ssl(SSL *ssl, char* name);
 int relay_user_ssl(SSL *ssl, char* name, int targetID, char *message);
-int direct_user_ssl(SSL *ssl, char* name, int targetID);
+int direct_user_ssl(SSL *ssl, char* username, int targetID);
 int file_user_ssl(SSL *ssl, char* name, int targetID, char *filename);
+void *handle_streaming(void *arg);
 
 //--- USER INFO ---//
 typedef struct {
@@ -66,6 +74,9 @@ int side_fd;
 //--- SSL ---//
 SSL_CTX *ssl_ctx;
 
+//--- USER INFO ---//
+int stream_fd;  // 視頻流服務器的 socket
+
 //--- MAIN FUNCTION ---//
 int main() {
     // 初始化 SSL 伺服器上下文
@@ -84,9 +95,22 @@ int main() {
         ERR_EXIT("create_listen_port");
     }
 
-    printf("Server is running on port %d\n", SERVER_PORT);
+    // 初始化視頻流服務器
+    struct sockaddr_in stream_addr;
+    if (create_listen_port(&stream_fd, &stream_addr, STREAM_PORT, MAX_ONLINE) == -1) {
+        ERR_EXIT("create_stream_port");
+    }
 
-    // 創建工作執行緒
+    // 設置超時
+    struct timeval tv;
+    tv.tv_sec = 5;  // 5 秒超時
+    tv.tv_usec = 0;
+    setsockopt(stream_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+    printf("Server is running on port %d\n", SERVER_PORT);
+    printf("Streaming server is running on port %d\n", STREAM_PORT);
+
+    // 建工作執行緒
     for (int i = 0; i < MAX_ONLINE; i++) {
         pthread_create(&workers[i], NULL, worker_thread, NULL);
     }
@@ -142,11 +166,14 @@ int main() {
     SSL_CTX_free(ssl_ctx);
     close(listen_fd);
     close(side_fd);
+    close(stream_fd);
+
     return 0;
 }
 
 // Worker
 void *worker_thread(void *arg) {
+    (void)arg;  // 避免未使用參數的警告
     while (!stop_flag) {
         // 取得task
         pthread_mutex_lock(&queue_lock);
@@ -172,7 +199,7 @@ void *worker_thread(void *arg) {
         // 處理未登入狀態
         handle_no_login(ssl);
 
-        // 關閉連接
+        // 關連接
         SSL_shutdown(ssl);
         SSL_free(ssl);
     }
@@ -236,7 +263,7 @@ int register_user_ssl(SSL *ssl, char* name) {
         return 0;
     }
 
-    // 檢查是否已註冊
+    // 檢查是否註冊
     for (int i = 0; i < user_count; i++) {
         if (strcmp(users[i].name, name) == 0) {
             if (SSL_write(ssl, NAME_REGISTERED, strlen(NAME_REGISTERED)) <= 0) return -1;
@@ -366,7 +393,29 @@ int handle_user_ssl(SSL *ssl, char* username) {
         buf[bytes] = '\0';
 
         int r; // 功能 function 的 Return 值
-        if (strcmp(buf, SHOW_LIST) == 0) {       // Show online users list
+        if (strncmp(buf, STREAM_CMD, strlen(STREAM_CMD)) == 0) {
+            // 解析文件名
+            char filename[BUFFER_SIZE];
+            if (sscanf(buf + strlen(STREAM_CMD) + 1, "%s", filename) != 1) {
+                if (SSL_write(ssl, "ERROR Invalid filename", strlen("ERROR Invalid filename")) <= 0)
+                    return -1;
+                continue;
+            }
+
+            // 告訴客戶端視頻流服務器的端口和文件名
+            char response[BUFFER_SIZE];
+            snprintf(response, sizeof(response), "%d %s", 
+                    STREAM_PORT,    // 8784
+                    filename);      // "test.mp4"
+            if (SSL_write(ssl, response, strlen(response)) <= 0)
+                return -1;
+            
+            // 處理視頻流
+            if (handle_stream_request(ssl, username, filename) < 0) {
+                printf("[Error] Streaming failed for user %s\n", username);
+            }
+
+        } else if (strcmp(buf, SHOW_LIST) == 0) {       // Show online users list
             pthread_mutex_lock(&users_lock);
             r = show_user_ssl(ssl, username);
             pthread_mutex_unlock(&users_lock);
@@ -419,6 +468,42 @@ int handle_user_ssl(SSL *ssl, char* username) {
         } else if (strcmp(buf, LOGOUT) == 0) {                     // Logout
             printf("[Logout] %s\n", username);
             break;
+            // Start of Selection
+            } else if (strncmp(buf, STREAM_CMD, strlen(STREAM_CMD)) == 0) {
+                char *filename = buf + strlen(STREAM_CMD) + 1;  // +1 跳過空格
+                char filepath[BUFFER_SIZE];
+                snprintf(filepath, BUFFER_SIZE, "%s", filename);
+
+                // 檢查文件是否存在
+                if (access(filepath, F_OK) == -1) {
+                    char error_msg[BUFFER_SIZE];
+                    snprintf(error_msg, BUFFER_SIZE, "ERROR: File %s not found", filename);
+                    if (SSL_write(ssl, error_msg, strlen(error_msg)) <= 0) {
+                        return -1;
+                    }
+                    continue;
+                }
+
+                // 創建 handle_streaming 線程
+                pthread_t stream_thread;
+                char *stream_args = strdup(filename);
+                if (pthread_create(&stream_thread, NULL, handle_streaming, (void *)stream_args) != 0) {
+                    perror("pthread_create");
+                    char error_msg[BUFFER_SIZE];
+                    snprintf(error_msg, BUFFER_SIZE, "ERROR: Failed to start streaming");
+                    if (SSL_write(ssl, error_msg, strlen(error_msg)) <= 0) {
+                        return -1;
+                    }
+                    free(stream_args);
+                    continue;
+                }
+                pthread_detach(stream_thread);
+
+                // 通知客戶端開始播放
+                if (SSL_write(ssl, "STREAM_STARTED", strlen("STREAM_STARTED")) <= 0) {
+                    return -1;
+                }
+
         } else {
             printf("[Error] Unknown command: %s\n", buf);
             if (SSL_write(ssl, UNKNOWN, strlen(UNKNOWN)) <= 0)
@@ -495,13 +580,14 @@ int relay_user_ssl(SSL *ssl, char* username, int targetID, char *message) {
 
 // Direct Message via SSL
 int direct_user_ssl(SSL *ssl, char* username, int targetID) {
+    (void)username;  // 避免未使用參數的警告
     // 排除不在線
     if (targetID < 0 || targetID >= user_count || users[targetID].status == false) {
         if (SSL_write(ssl, OFFLINE, strlen(OFFLINE)) <= 0) return -1;
         return 0;
     }
 
-    // 傳目標的 Ip 及 Port
+    // 傳目標的 Ip 和 Port
     char to_client[BUFFER_SIZE];
     memset(to_client, 0, BUFFER_SIZE);
     sprintf(to_client, "%s %d", users[targetID].ip, users[targetID].receiver_port);
@@ -569,5 +655,228 @@ int file_user_ssl(SSL *ssl, char* username, int targetID, char *filename) {
             SSL_write(ssl, ACK_FILE, strlen(ACK_FILE));
         }
     }
+    return 1;
+}
+
+// 添加視頻流處理函數
+void *handle_streaming(void *arg) {
+    printf("handle_streaming\n");
+    int client_fd = *(int*)arg;
+    free(arg);
+    char filename[BUFFER_SIZE];
+    
+    // 接收文件名
+    memset(filename, 0, sizeof(filename));
+    if (recv(client_fd, filename, sizeof(filename), 0) <= 0) {
+        close(client_fd);
+        return NULL;
+    }
+    
+    // 初始化 FFmpeg
+    #if LIBAVFORMAT_VERSION_MAJOR < 58
+        av_register_all();
+    #endif
+
+    AVFormatContext *format_ctx = NULL;
+    
+    // 打開視頻文件
+    if (avformat_open_input(&format_ctx, filename, NULL, NULL) < 0) {
+        fprintf(stderr, "Could not open video file\n");
+        close(client_fd);
+        return NULL;
+    }
+
+    // 查找流信息
+    if (avformat_find_stream_info(format_ctx, NULL) < 0) {
+        fprintf(stderr, "Could not find stream information.\n");
+        avformat_close_input(&format_ctx);
+        close(client_fd);
+        return NULL;
+    }
+    
+    // 查找視頻流
+    int video_stream_index = -1;
+    for (int i = 0; i < format_ctx->nb_streams; i++) {
+        if (format_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_stream_index = i;
+            break;
+        }
+    }
+
+    if (video_stream_index == -1) {
+        fprintf(stderr, "Could not find a video stream.\n");
+        avformat_close_input(&format_ctx);
+        close(client_fd);
+        return NULL;
+    }
+
+    AVCodecParameters *codec_params = format_ctx->streams[video_stream_index]->codecpar;
+
+    // 等待客戶端確認
+    char buffer[BUFFER_SIZE];
+    memset(buffer, 0, BUFFER_SIZE);
+    if (recv(client_fd, buffer, BUFFER_SIZE, 0) <= 0 || buffer[0] != 'Y') {
+        avformat_close_input(&format_ctx);
+        close(client_fd);
+        return NULL;
+    }
+
+    // 發送 SPS/PPS
+    int sps_size = codec_params->extradata_size;
+    if (send(client_fd, &sps_size, sizeof(sps_size), 0) == -1 ||
+        send(client_fd, codec_params->extradata, sps_size, 0) == -1) {
+        avformat_close_input(&format_ctx);
+        close(client_fd);
+        return NULL;
+    }
+
+    // 傳輸視頻幀
+    AVPacket packet;
+    int frame_count = 0;
+
+    while (av_read_frame(format_ctx, &packet) >= 0) {
+        if (packet.stream_index == video_stream_index) {
+            int frame_size = packet.size;
+            if (send(client_fd, &frame_size, sizeof(frame_size), 0) == -1 ||
+                send_full(client_fd, packet.data, packet.size) == -1) {
+                av_packet_unref(&packet);
+                break;
+            }
+            usleep(33333);  // 約 30fps
+        }
+        av_packet_unref(&packet);
+        frame_count++;
+        printf("frame_count: %d\n", frame_count);
+    }
+
+    avformat_close_input(&format_ctx);
+    close(client_fd);
+    return NULL;
+}
+
+// 處理視頻流請求
+int handle_stream_request(SSL *ssl, const char *username, const char *filename) {
+    printf("server handle_stream_request\n");
+    if (access(filename, F_OK) == -1) {
+        if (SSL_write(ssl, "ERROR File not found", strlen("ERROR File not found")) <= 0)
+            return -1;
+        return 0;
+    }
+
+    // 等待客戶端連接到視頻流端口
+    struct sockaddr_in stream_client_addr;
+    socklen_t stream_client_len = sizeof(stream_client_addr);
+
+    printf("Waiting for client to connect...\n");
+    int stream_client_fd = accept(stream_fd, (struct sockaddr*)&stream_client_addr, &stream_client_len);
+    
+    printf("stream_client_fd: %d\n", stream_client_fd);
+    if (stream_client_fd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            printf("Accept timed out\n");
+            return -1;
+        }
+        printf("[Error] Accept streaming client failed\n");
+        return -1;
+    }
+
+    printf("[Stream] User %s streaming file: %s\n", username, filename);
+
+    // 初始化 FFmpeg
+    #if LIBAVFORMAT_VERSION_MAJOR < 58
+        av_register_all();
+    #endif
+
+    // 打開視頻文件
+    AVFormatContext *format_ctx = NULL;
+    if (avformat_open_input(&format_ctx, filename, NULL, NULL) < 0) {
+        fprintf(stderr, "Could not open video file\n");
+        close(stream_client_fd);
+        return -1;
+    }
+
+    // ... 其餘視頻處理代碼 ...
+
+    // 查找流信息
+    if (avformat_find_stream_info(format_ctx, NULL) < 0) {
+        fprintf(stderr, "Could not find stream information.\n");
+        avformat_close_input(&format_ctx);
+        close(stream_client_fd);
+        return -1;
+    }
+
+    // 查找視頻流
+    int video_stream_index = -1;
+    for (int i = 0; i < format_ctx->nb_streams; i++) {
+        if (format_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_stream_index = i;
+            break;
+        }
+    }
+    if (video_stream_index == -1) {
+        fprintf(stderr, "Could not find a video stream.\n");
+        avformat_close_input(&format_ctx);
+        close(stream_client_fd);
+        return -1;
+    }
+
+    AVCodecParameters *codec_params = format_ctx->streams[video_stream_index]->codecpar;
+
+    printf("SPS/PPS size: %d\n", codec_params->extradata_size);
+    if (codec_params->extradata_size <= 0) {
+        fprintf(stderr, "Invalid SPS/PPS data.\n");
+        close(stream_client_fd);
+        return -1;
+    }
+
+    printf("extradata (size=%d): ", codec_params->extradata_size);
+    for (int i = 0; i < codec_params->extradata_size; i++) {
+        printf("%02X ", codec_params->extradata[i]);
+    }
+    printf("\n");
+
+    printf("Width: %d, Height: %d, Pix Format: %d\n",
+        codec_params->width, codec_params->height, codec_params->format);
+
+    // 發送 SPS/PPS
+    uint8_t *sps = codec_params->extradata;
+    int sps_size = codec_params->extradata_size;
+
+    if (send(stream_client_fd, &sps_size, sizeof(sps_size), 0) == -1) {
+        fprintf(stderr, "Failed to send SPS size\n");
+        avformat_close_input(&format_ctx);
+        close(stream_client_fd);
+        return -1;
+    }
+    if (send(stream_client_fd, sps, sps_size, 0) == -1) {
+        fprintf(stderr, "Failed to send SPS data\n");
+        avformat_close_input(&format_ctx);
+        close(stream_client_fd);
+        return -1;
+    }
+
+    printf("Sent SPS/PPS data of size %d bytes.\n", sps_size);
+
+    // 傳輸視頻幀
+    AVPacket packet;
+    int frame_count = 0;
+
+    while (av_read_frame(format_ctx, &packet) >= 0) {
+        if (packet.stream_index == video_stream_index) {
+            int frame_size = packet.size;
+            if (send(stream_client_fd, &frame_size, sizeof(frame_size), 0) == -1 ||
+                send_full(stream_client_fd, packet.data, packet.size) == -1) {
+                av_packet_unref(&packet);
+                break;
+            }
+            usleep(33333);  // 約 30fps
+        }
+        av_packet_unref(&packet);
+        frame_count++;
+        printf("frame_count: %d\n", frame_count);
+    }
+
+    avformat_close_input(&format_ctx);
+    close(stream_client_fd);
     return 1;
 }

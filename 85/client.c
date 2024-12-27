@@ -7,12 +7,22 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <assert.h>
 #include <arpa/inet.h>
 #include <gtk/gtk.h>
 
 // OpenSSL Headers
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+
+// SDL2 Headers
+#include <SDL2/SDL.h>
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
 
 //--- THREADS ---//
 void *client_thread(void *arg);
@@ -36,6 +46,7 @@ int show_online_ssl(SSL *ssl);
 int send_relay_ssl(SSL *ssl);
 int send_direct_ssl(SSL *ssl);
 int send_file_ssl(SSL *ssl);
+int recv_streaming_ssl(SSL *ssl);   // 添加新的函數聲明
 
 // file_thread
 int file_questioner(char *from, char *filename);
@@ -70,14 +81,15 @@ void show_logged_in_menu() {
     printf("2. Relay send message\n");
     printf("3. Direct send message\n");
     printf("4. Send file\n");
-    printf("5. Log out\n");
+    printf("5. Stream video\n");
+    printf("6. Log out\n");
 }
 //--- GTK FUNCTION ---//
 // delete_event 信號處理函數
 gboolean on_delete_event(GtkWidget *widget, GdkEvent *event, gpointer data) {
     printf("delete_event triggered\n");
     gtk_main_quit(); // 退出主事件迴圈
-    return FALSE;    // 返回 FALSE，允許進一步處理（會觸發 destroy 信號）
+    return FALSE;    // 返回 FALSE允許進一步處理（會觸發 destroy 信號）
 }
 
 // destroy 信號處理函數
@@ -190,7 +202,7 @@ int main() {
     // 建立Receiver socket (未使用 SSL)
     // 注意：Receiver socket 主要在客戶端接收來自其他客戶端的直接消息，不涉及 SSL
     // 這裡假設客戶端不需要建立接收 socket，因為直接消息是由其他客戶端發起的
-    // 如果需要，您可以自行添加接收 socket 的實現
+    // 如果需要，您可以自行添加接收 socket 的實作
 
     // 連線至server
     struct sockaddr_in servaddr;
@@ -436,8 +448,18 @@ int send_login_ssl(SSL *ssl) {
 
 // Logged In via SSL
 int handle_logged_ssl(SSL *ssl) {
+    char buf[BUFFER_SIZE];
     while (true) {
-        show_logged_in_menu();
+        printf("\n%s\n", LINE);
+        printf("Command list:\n");
+        printf("1) show list\n");
+        printf("2) broadcast\n");
+        printf("3) chat\n");
+        printf("4) file transfer\n");
+        printf("5) stream video\n");
+        printf("6) logout\n");
+        printf("%s\n", LINE);
+
         int choice;
         printf("Enter your choice: ");
         scanf("%d", &choice);
@@ -451,21 +473,10 @@ int handle_logged_ssl(SSL *ssl) {
         } else if (choice == 4) {
             send_file_ssl(ssl);
         } else if (choice == 5) {
-            if (SSL_write(ssl, LOGOUT, strlen(LOGOUT)) <= 0) {
-                printf("Error in SSL_write\n");
+            recv_streaming_ssl(ssl);
+        } else if (choice == 6) {
+            if (SSL_write(ssl, LOGOUT, strlen(LOGOUT)) <= 0)
                 break;
-            }
-            user.status = false;
-            // if (user.relay_ssl) {
-                SSL_shutdown(user.relay_ssl);
-                // SSL_free(user.relay_ssl);
-                // user.relay_ssl = NULL;
-            // }
-            // if (user.file_ssl) {
-                SSL_shutdown(user.file_ssl);
-                // SSL_free(user.file_ssl);
-                // user.file_ssl = NULL;
-            // }
             printf(GREEN"Logged out successfully.\n"NONE);
             break;
         } else {
@@ -803,3 +814,249 @@ void file_thread() {
     }
     printf("File thread leave\n");
 }
+
+// 接收視頻流
+int recv_streaming_ssl(SSL *ssl) {
+    char buf[BUFFER_SIZE];
+    
+    // 发送STREAM_CMD和文件名以请求服务器开始流媒体
+    char filename[BUFFER_SIZE];
+    printf("请输入要发送的文件名: ");
+    scanf("%s", filename);
+    filename[strcspn(filename, "\n")] = '\0';
+    
+    char stream_cmd[BUFFER_SIZE];
+    snprintf(stream_cmd, sizeof(stream_cmd), "%s %s", STREAM_CMD, filename);
+    if (SSL_write(ssl, stream_cmd, strlen(stream_cmd)) <= 0) {
+        printf("发送STREAM_CMD失败\n");
+        return -1;
+    }
+    
+    // 建立到視頻流服務器的連接
+    int stream_fd;
+    struct sockaddr_in stream_addr;
+    if (connect_to_port(&stream_fd, &stream_addr, SERVER_IP, STREAM_PORT) < 0) {
+        printf("Failed to connect to streaming server\n");
+        return -1;
+    }
+
+    printf("Connected to streaming server on port %d\n", STREAM_PORT);
+    
+    // 初始化 FFmpeg
+    av_register_all();
+
+    // 接收 SPS/PPS
+    int sps_size;
+    if (recv(stream_fd, &sps_size, sizeof(sps_size), 0) <= 0)
+        error_exit("Failed to receive SPS size");
+
+    uint8_t *sps = (uint8_t *)malloc(sps_size);
+    if (recv(stream_fd, sps, sps_size, 0) <= 0)
+        error_exit("Failed to receive SPS data");
+
+    printf("Received SPS/PPS of size %d bytes.\n", sps_size);
+
+    // 初始化解碼器
+    AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+    if (!codec)
+        error_exit("Codec not found");
+
+    AVCodecContext *codec_ctx = avcodec_alloc_context3(codec);
+    if (!codec_ctx)
+        error_exit("Could not allocate codec context");
+
+    codec_ctx->extradata = sps;
+    codec_ctx->extradata_size = sps_size;
+
+    printf("SPS/PPS size: %d\n", codec_ctx->extradata_size);
+    if (codec_ctx->extradata_size <= 0) {
+        fprintf(stderr, "Invalid SPS/PPS data.\n");
+        return -1;
+    }
+
+    for (int i = 0; i < codec_ctx->extradata_size; i++) {
+        printf("%02X ", codec_ctx->extradata[i]);
+    }
+    printf("\n");
+
+    if (avcodec_open2(codec_ctx, codec, NULL) < 0)
+        error_exit("Could not open codec");
+
+    // 檢查是否需要解碼幀來初始化
+    if (codec_ctx->width == 0 || codec_ctx->height == 0) {
+        printf("Decoder needs more data to initialize. Decoding first frame...\n");
+
+        // 接收幀大小
+        int frame_size;
+        if (recv(stream_fd, &frame_size, sizeof(frame_size), 0) <= 0) {
+            perror("Failed to receive frame size");
+        }
+
+        // 接收幀數據
+        uint8_t *frame_data = (uint8_t *)malloc(frame_size);
+        int bytes_recv = recv_full(stream_fd, frame_data, frame_size);
+
+        printf("Received frame data: size=%d, bytes=%d\n", frame_size, bytes_recv);
+
+        AVPacket packet;
+        av_init_packet(&packet);
+        packet.data = frame_data;
+        packet.size = frame_size;
+
+        if (avcodec_send_packet(codec_ctx, &packet) == 0) {
+            AVFrame *frame = av_frame_alloc();
+            if (avcodec_receive_frame(codec_ctx, frame) == 0) {
+                printf("After decoding: width=%d, height=%d, pix_fmt=%d\n",
+                    codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt);
+            }
+            av_frame_free(&frame);
+        }
+
+        free(frame_data);
+    }
+
+    printf("Decoder initialized: width=%d, height=%d, pix_fmt=%d\n",
+       codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt);
+
+    // 初始化 SDL2
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        fprintf(stderr, "Could not initialize SDL: %s\n", SDL_GetError());
+        return -1;
+    }
+
+    SDL_Window *window = SDL_CreateWindow("Video Stream",
+                                          SDL_WINDOWPOS_UNDEFINED,
+                                          SDL_WINDOWPOS_UNDEFINED,
+                                          1280, 720,
+                                          SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    if (!window) {
+        fprintf(stderr, "SDL_CreateWindow Error: %s\n", SDL_GetError());
+        return -1;
+    }
+
+    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, 0);
+    SDL_Texture *texture = NULL;
+
+    // 接收視頻幀並解碼
+    AVPacket packet;
+    AVFrame *frame = av_frame_alloc();
+
+    struct SwsContext *sws_ctx = sws_getContext(codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
+                            codec_ctx->width, codec_ctx->height, AV_PIX_FMT_YUV420P,
+                            SWS_BILINEAR, NULL, NULL, NULL);
+    if (!sws_ctx) {
+        fprintf(stderr, "Failed to initialize sws_getContext.\n");
+        return -1;
+    }
+
+    if (!frame || !sws_ctx)
+        error_exit("Could not initialize FFmpeg structures");
+
+    uint8_t *y_plane = (uint8_t *)malloc(codec_ctx->width * codec_ctx->height);
+    uint8_t *u_plane = (uint8_t *)malloc(codec_ctx->width * codec_ctx->height / 4);
+    uint8_t *v_plane = (uint8_t *)malloc(codec_ctx->width * codec_ctx->height / 4);
+    int y_pitch = codec_ctx->width;
+    int uv_pitch = codec_ctx->width / 2;
+
+    uint8_t *data[3] = {y_plane, u_plane, v_plane};
+    int linesize[3] = {y_pitch, uv_pitch, uv_pitch};
+
+    int frame_initialized = 0;
+    int frame_count = 0;
+
+    int consecutive_errors = 0;
+    while (1) {
+        // 接收幀大小
+        int frame_size = 0;
+        if (recv_full(stream_fd, &frame_size, sizeof(frame_size)) <= 0) {
+            perror("Failed to receive frame size!");
+            break;  
+        }
+
+        uint8_t *frame_data = (uint8_t *)malloc(frame_size);
+        int bytes_recv = recv_full(stream_fd, frame_data, frame_size);
+        if (bytes_recv <= 0) {
+            free(frame_data);
+            break;
+        }
+
+        printf("Received frame data: size=%d, bytes=%d\n", frame_size, bytes_recv);
+        assert(bytes_recv == frame_size);
+        consecutive_errors = 0;  // 重置錯誤計數
+
+        // 解碼
+        av_init_packet(&packet);
+        packet.data = frame_data;
+        packet.size = frame_size;
+
+        if (avcodec_send_packet(codec_ctx, &packet) < 0) {
+            fprintf(stderr, "Error sending packet to decoder.\n");
+            free(frame_data);
+            continue;
+        }
+
+        if (avcodec_receive_frame(codec_ctx, frame) == 0) {
+            // 延遲初始化 Texture
+            if (!frame_initialized) {
+                printf("Initializing video context: width=%d, height=%d, pix_fmt=%d\n",
+                    codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt);
+
+                texture = SDL_CreateTexture(renderer,
+                                            SDL_PIXELFORMAT_YV12,
+                                            SDL_TEXTUREACCESS_STREAMING,
+                                            codec_ctx->width,
+                                            codec_ctx->height);
+                if (!texture) {
+                    fprintf(stderr, "SDL_CreateTexture Error: %s\n", SDL_GetError());
+                    return -1;
+                }
+
+                frame_initialized = 1;
+            }
+
+            // 將解碼幀轉換為 YUV420P 格式
+            uint8_t *data[3] = {y_plane, u_plane, v_plane};
+            int linesize[3] = {y_pitch, uv_pitch, uv_pitch};
+
+            sws_scale(sws_ctx, (const uint8_t *const *)frame->data, frame->linesize, 0,
+                    codec_ctx->height, data, linesize);
+
+            // 顯示幀
+            SDL_UpdateYUVTexture(texture, NULL, y_plane, y_pitch,
+                                u_plane, uv_pitch, v_plane, uv_pitch);
+            SDL_RenderClear(renderer);
+            SDL_RenderCopy(renderer, texture, NULL, NULL);
+            SDL_RenderPresent(renderer);
+        }
+
+        free(frame_data);
+        frame_count++;
+        av_packet_unref(&packet);
+
+        printf("Frame count: %d\n", frame_count);
+
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_QUIT) {
+                goto cleanup;
+            }
+        }
+    }
+
+cleanup:
+    if (texture) SDL_DestroyTexture(texture);
+    if (renderer) SDL_DestroyRenderer(renderer);
+    if (window) SDL_DestroyWindow(window);
+    if (frame) av_frame_free(&frame);
+    if (sws_ctx) sws_freeContext(sws_ctx);
+    free(y_plane);
+    free(u_plane);
+    free(v_plane);
+    avcodec_free_context(&codec_ctx);
+    SDL_Quit();
+    close(stream_fd);
+    printf("Video playback ended\n");
+    return 0;
+}
+
+
